@@ -63,6 +63,12 @@ OUT_RANGE_CLOSE_MIN = float(os.environ.get("OUT_OF_RANGE_CLOSE_MIN", 30))
 TOKEN_COOLDOWN_H = float(os.environ.get("TOKEN_COOLDOWN_H", 6))
 # kedalaman minimal sisi USDG pool supaya dianggap layak LP
 MIN_USDG_POOL_USD = float(os.environ.get("MIN_USDG_POOL_USD", 500))
+# target fee harian (USD) — arah berburu AI: fee harus menutup minus harga
+FEE_TARGET_USD_DAY = float(os.environ.get("FEE_TARGET_USD_DAY", 10))
+# rotasi fee-hunter: posisi umur >= MIN_H jam dengan laju fee < MIN_PCT_DAY
+# (% modal/hari) ditutup — modal pindah ke pool yang lebih panas (0 = mati)
+FEE_ROTATE_MIN_H = float(os.environ.get("FEE_ROTATE_MIN_H", 6))
+FEE_ROTATE_MIN_PCT_DAY = float(os.environ.get("FEE_ROTATE_MIN_PCT_DAY", 4))
 # ala Meridian minHolders/maxTop10Pct: distribusi holder sehat (dari GoPlus)
 MIN_HOLDERS = int(os.environ.get("MIN_HOLDERS", 500))
 MAX_TOP10_PCT = float(os.environ.get("MAX_TOP10_PCT", 60))
@@ -189,6 +195,19 @@ async def pos_zone(p: dict, now: float):
     return pnl, zone, key
 
 
+def _umur(ts: str) -> str:
+    """Umur posisi dari ts 'YYYY-mm-dd HH:MM:SS' -> '1h 2j' / '5j 30m'."""
+    import time
+    try:
+        det = time.time() - time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+        h, m = divmod(int(det // 60), 60)
+    except Exception:
+        return "?"
+    if h >= 24:
+        return f"{h // 24}h {h % 24}j"
+    return f"{h}j {m}m" if h else f"{m}m"
+
+
 def allowed(update: Update) -> bool:
     return not ALLOWED or (update.effective_user and update.effective_user.id in ALLOWED)
 
@@ -211,7 +230,22 @@ async def safe_send(bot, chat_id: int, text: str):
         await bot.send_message(chat_id, text, disable_web_page_preview=True)
 
 
+_GT_LOCK = asyncio.Lock()
+_GT_LAST = [0.0]
+
+
 async def gt_get(path: str) -> dict:
+    # throttle global: GT free tier ~30 req/menit; siklus fee-hunter bisa 20+ call
+    import time as _tg
+    async with _GT_LOCK:
+        tunggu = 2.1 - (_tg.monotonic() - _GT_LAST[0])
+        if tunggu > 0:
+            await asyncio.sleep(tunggu)
+        _GT_LAST[0] = _tg.monotonic()
+    return await _gt_get_raw(path)
+
+
+async def _gt_get_raw(path: str) -> dict:
     async with aiohttp.ClientSession() as s:
         async with s.get(f"{GT}{path}", headers={"accept": "application/json"}) as r:
             r.raise_for_status()
@@ -335,8 +369,14 @@ async def ai_analyze(rows: list[dict], mode: str, extra: str = "") -> str:
            "UTAMAKAN LEBAR -30% s/d -50% untuk meme runner volatil (nunggu dip, jarang kena stop-loss, "
            "tetap makan fee tiap harga masuk range); -10% s/d -15% HANYA untuk token yang sudah "
            "terbukti di support kuat; kalau bigcap runner sarankan full range (deploy manual)\n")
-        + f"Aturan posisi: maks {MAX_POSITIONS} posisi aktif, compound profit, "
-        "target $2k per posisi. Gas kalau ekspektasi fee > IL.\n"
+        + f"Aturan posisi: maks {MAX_POSITIONS} posisi aktif, compound profit.\n"
+        f"MODE FEE-HUNTER (prioritas user): target fee >= ${FEE_TARGET_USD_DAY:.0f}/hari. "
+        "Proyeksi fee harian posisi ~= usdg_fee_apr_pct/365 x modal. Prioritaskan "
+        "kandidat ber-usdg_fee_apr_pct TERTINGGI yang lolos keamanan. Minus harga "
+        "BOLEH — yang penting proyeksi fee harian > proyeksi minus harian "
+        "(lihat volatilitas chg_24h); WAJIB tulis hitungan proyeksi itu di analisis. "
+        "Tapi keamanan tetap HARAM dilanggar: honeypot/rug/bundler/wash_trading "
+        "= tolak, fee tidak bisa menutup rug -100%.\n"
         f"Mode: {mode}. Jawab ringkas bahasa Indonesia, format Telegram markdown, "
         "max 5 kandidat terbaik, urutkan dari skor tertinggi. "
         "JANGAN menyingkat contract address.\n"
@@ -452,6 +492,30 @@ async def fetch_candidates():
         if r["ca"] not in seen:
             seen.add(r["ca"])
             rows.append(r)
+    gm = {}
+    try:
+        gm = await asyncio.to_thread(_gmgn_trending)
+    except Exception:
+        log.exception("GMGN trending gagal — sumber & enrichment dilewati")
+    ada = {x["ca"].lower() for x in rows}
+    for ca_l, g in gm.items():
+        # token kelas Meowshi: trending di GMGN tapi luput dari top-volume GT
+        if ca_l in ada or float(g.get("volume") or 0) < MIN_VOL_24H:
+            continue
+        rows.append({
+            "name": f"{g.get('symbol') or ca_l[:8]} (GMGN)", "ca": g["address"],
+            "dex": "", "fee_pct": None, "est_fee_apr_pct": None,
+            "fees_24h_usd": None, "price_usd": g.get("price"),
+            "liq_usd": float(g.get("liquidity") or 0),
+            "mcap_usd": float(g.get("market_cap") or 0),
+            "vol_5m": 0.0, "vol_1h": 0.0,
+            "vol_24h": float(g.get("volume") or 0),
+            "chg_5m": g.get("price_change_percent5m"),
+            "chg_1h": g.get("price_change_percent1h"),
+            "chg_24h": g.get("price_change_percent"),
+            "txs_5m": 0, "wallets_5m": 0, "bundler_suspect": False,
+            "created_at": None, "sumber": "gmgn_trending",
+        })
     rows = [r for r in rows if not any(b in (r["dex"] or "").lower() for b in DEX_BLACKLIST)]
     skip_ca = {os.environ.get("USDG_ADDRESS", "").lower(),
                os.environ.get("WETH_ADDRESS", "").lower()}
@@ -549,8 +613,14 @@ async def fetch_candidates():
             r["alasan_gagal"] = r["alasan_gagal"] + ["GMGN: honeypot"]
         lp_pad = (g.get("launchpad") or "").lower()
         if any(b in lp_pad for b in DEX_BLACKLIST):
-            r["lolos_filter"] = False
-            r["alasan_gagal"] = r["alasan_gagal"] + [f"GMGN: launchpad {lp_pad}"]
+            # launchpad sarang scam boleh HANYA kalau token sudah teruji pasar:
+            # holders >= 1000 dan smart money >= 20 (contoh: RWA lolos)
+            if ((g.get("holder_count") or 0) >= 1000
+                    and (g.get("smart_degen_count") or 0) >= 20):
+                r["launchpad_lolos_uji"] = lp_pad
+            else:
+                r["lolos_filter"] = False
+                r["alasan_gagal"] = r["alasan_gagal"] + [f"GMGN: launchpad {lp_pad}"]
         r["gmgn"] = {
             "smart_money": g.get("smart_degen_count"),
             "kol": g.get("renowned_count"),
@@ -565,10 +635,11 @@ async def fetch_candidates():
             "sosmed_dup": {"tw": g.get("twitter_dup"),
                            "web": g.get("website_dup")},
         }
-    hits = sorted(rows, key=lambda r: (not r["lolos_filter"], -r["vol_24h"]))
+    hits = sorted(rows, key=lambda r: (
+        not r["lolos_filter"], -(r["vol_24h"] / max(r["liq_usd"], 1))))
     if QUOTE == "USDG":
         from lp import quote_pool_liquidity
-        for r in hits[:12]:
+        for r in hits[:20]:
             if r["lolos_filter"] and re.fullmatch(r"0x[a-fA-F0-9]{40}", r["ca"] or ""):
                 try:
                     usd = await asyncio.to_thread(quote_pool_liquidity, r["ca"])
@@ -778,7 +849,8 @@ async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                else f"-{p['range_pct']:.0f}%)\n")
             + f"  `{p['ca']}`\n"
             f"  entry ${p.get('entry_price', 0):.6g} → now ${now:.6g} ({chg})\n"
-            f"  {zone} | est PnL (tanpa fee): {pnl_s} | sejak {p['ts']}"
+            f"  {zone} | est PnL (tanpa fee): {pnl_s}"
+            f" | umur {_umur(p['ts'])} (sejak {p['ts']})"
             + isi
             + (f"\n  📝 {p['reason'][:200]}" if p.get("reason") else ""))
     lines.append(f"\nSlot: {len(pos)}/{MAX_POSITIONS} | "
@@ -1016,8 +1088,12 @@ def _v4_real(p: dict) -> dict:
         zone = "below" if q_is_c0 else "above"
     else:
         zone = "in"
+    lo_raw, hi_raw = 1.0001 ** p["tick_lower"], 1.0001 ** p["tick_upper"]
+    pa = 1e12 / hi_raw if q_is_c0 else lo_raw * 1e12
+    pb = 1e12 / lo_raw if q_is_c0 else hi_raw * 1e12
     return {"price": price, "value": tok_amt * price + q_amt,
-            "fee_usd": tok_fee * price + q_fee, "zone": zone}
+            "fee_usd": tok_fee * price + q_fee, "zone": zone,
+            "lo": min(pa, pb), "hi": max(pa, pb), "tok": tok_amt, "usdg": q_amt}
 
 
 def _v4_fee_usd(p: dict, price_now) -> float | None:
@@ -1053,6 +1129,7 @@ async def _manage_locked():
     if not pos:
         return [], []
     alerts, status, changed = [], [], False
+    tot_pos = dep_tot = net_tot = 0.0
     for i, p in enumerate(pos, 1):
         try:
             head = f"#{i} {p['name']}"
@@ -1097,10 +1174,58 @@ async def _manage_locked():
                 except Exception:
                     pass
                 fee_s += ")"
-            status.append(f"*{head}* — {zone}\n"
-                          f"      ${now:.6g} ({chg} dr entry)"
-                          + (f" · PnL {pnl:+.1f}%" if pnl is not None else "")
-                          + fee_s)
+            if real and cap_r > 0 and real["hi"] > real["lo"]:
+                lo, hi = real["lo"], real["hi"]
+                seg = 12
+                i = min(seg, max(0, int((now - lo) / (hi - lo) * (seg + 1))))
+                bar = "🟦" * i + "❙" + "🟩" * (seg - i)
+                fee_v = fee_usd or 0
+                net = real["value"] + fee_v - cap_r
+                sym = p["name"].split(" /")[0].strip().replace(" (GMGN)", "")
+                try:
+                    import time as _tc
+                    age_h = (_tc.time() - _tc.mktime(
+                        _tc.strptime(p["ts"], "%Y-%m-%d %H:%M:%S"))) / 3600
+                    laju = f" (${fee_v / age_h:.2f}/jam)" if age_h >= 0.5 else ""
+                except Exception:
+                    laju = ""
+                tot_pos += real["value"] + fee_v
+                dep_tot += cap_r
+                net_tot += net
+                panah = "▲" if net >= 0 else "▼"
+                sep = "─" * 28
+                status.append(
+                    f"*{head}*\n"
+                    f"{panah} *{net:+.2f} ({net / cap_r * 100:+.1f}%)* · {zone}\n"
+                    f"{bar}\n"
+                    f"`{lo:.6g} ← {now:.6g} → {hi:.6g}`"
+                    f"  ↓{(now - lo) / now * 100:.0f}% · ↑{(hi - now) / now * 100:.0f}%\n"
+                    f"{sep}\n"
+                    f"Modal ${cap_r:.2f}\n"
+                    f"{real['tok']:,.0f} {sym} + {real['usdg']:,.2f} USDG · "
+                    f"umur {_umur(p['ts'])}{laju}\n"
+                    f"{sep}\n"
+                    f"Nilai ${real['value']:.2f} + Fee ${fee_v:.2f} = "
+                    f"*${real['value'] + fee_v:.2f}*\n"
+                    f"{sep}")
+            else:
+                status.append(f"*{head}* — {zone}\n"
+                              f"      ${now:.6g} ({chg} dr entry)"
+                              + (f" · PnL {pnl:+.1f}%" if pnl is not None else "")
+                              + fee_s + f" · umur {_umur(p['ts'])}")
+            if (FEE_ROTATE_MIN_H > 0 and fee_usd is not None and cap > 0
+                    and "_close" not in p):
+                try:
+                    import time as _tr
+                    umur_h = (_tr.time() - _tr.mktime(
+                        _tr.strptime(p["ts"], "%Y-%m-%d %H:%M:%S"))) / 3600
+                    laju_pct = fee_usd / umur_h * 24 / cap * 100
+                    if umur_h >= FEE_ROTATE_MIN_H and laju_pct < FEE_ROTATE_MIN_PCT_DAY:
+                        p["_close"] = (f"rotasi fee-hunter: laju fee {laju_pct:.1f}%"
+                                       f" modal/hari < {FEE_ROTATE_MIN_PCT_DAY:g}%"
+                                       " — modal pindah ke pool lebih panas")
+                except Exception:
+                    pass
             if (FEE_TP_PCT > 0 and fee_usd and cap > 0 and "_close" not in p
                     and fee_usd >= cap * FEE_TP_PCT / 100):
                 p["_close"] = (f"take-profit: fee terkumpul ${fee_usd:.2f} = "
@@ -1163,6 +1288,18 @@ async def _manage_locked():
     for x, _ in cls:
         x.pop("_reb", None)
     reb = [(x, x.pop("_reb")) for x in list(pos) if "_reb" in x]
+    if status:
+        try:  # footer: total keseluruhan (dompet + posisi + fee) vs modal masuk
+            from lp import wallet_balance_quote
+            bal = await asyncio.to_thread(wallet_balance_quote)
+            total = bal + tot_pos
+            try:
+                base = float(json.load(open(PNL_BASELINE)).get("modal_usd") or 0)
+            except Exception:
+                base = 0.0
+            status.append(f"💼 *Total ${total:.2f}*")
+        except Exception:
+            log.exception("hitung total portofolio gagal")
     if changed or cls or reb:
         save_positions(pos)
     for p, why in cls:
@@ -1314,6 +1451,8 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE):
         slot = MAX_POSITIONS - len(pos)
         held = {p["ca"].lower() for p in pos}
         cooldown = _recent_closed_cas()
+        hits = [r for r in hits
+                if r["ca"].lower() not in cooldown and r["ca"].lower() not in held]
         extra = (f"POSISI TERBUKA: {len(pos)}/{MAX_POSITIONS} "
                  f"({', '.join(p['name'] for p in pos) or 'tidak ada'}).\n")
         if cooldown:
@@ -1331,15 +1470,26 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE):
                 "SEKARANG (ekspektasi fee vs IL, volume, thesis util/komun) — atau kenapa "
                 "kamu memilih TIDAK deploy siklus ini.\n"
                 "Lalu SATU baris persis: DEPLOY: <ca_lengkap> <range_pct> "
-                "(bukan token yang sudah dipegang), atau DEPLOY: NONE. Konservatif > FOMO.\n"
+                "(bukan token yang sudah dipegang), atau DEPLOY: NONE. "
+                f"Fee-hunter: kejar fee >= ${FEE_TARGET_USD_DAY:.0f}/hari dari kandidat "
+                "yang lolos keamanan; NONE hanya kalau semua kandidat gagal keamanan "
+                "atau proyeksi fee-nya tidak menutup risiko minus.\n"
                 f"TIMING (anti beli pucuk): JANGAN deploy token yang chg_5m > +{MAX_CHG_5M:g}% "
                 f"atau chg_1h > +{MAX_CHG_1H:g}% — lagi pump aktif, posisi bakal langsung "
                 "kabur ke atas range; tunggu koreksi. Ideal: chg_1h merah tipis, chg_24h hijau.\n"
-                "RANGE: sekitar 1.5x |chg_24h| token, MAKSIMAL 40% (range sempit = fee "
-                "lebih padat; kalau token butuh range > 40%, dia terlalu volatil -> pilih "
-                "kandidat lain). Posisi dipasang DUA SISI mengapit harga (±range/2): "
-                "fee jalan sejak awal, tapi dana ikut harga token — hindari token yang "
-                "rawan dump dalam; prioritas volume tinggi + harga sideways.")
+                "RANGE: idealnya 1.5x |chg_24h|, MAKSIMAL 40%. Kebutuhan range > 40% "
+                "BUKAN larangan otomatis (mode multihour): boleh deploy dengan range "
+                "40% ASAL proyeksi fee harian pool USDG jelas > proyeksi minus harian "
+                "— posisi dijaga rotasi 3 jam + auto-close keluar-range 30 mnt, jadi "
+                "yang dipanen jam-jam in-range, bukan tren. Sebut trade-off itu. "
+                "POOL USDG DANGKAL BUKAN ALASAN TOLAK — justru peluang (strategi "
+                "'jadi pool-nya'): porsi fee kamu >= modal/(modal+usdg_pool_usd), "
+                "makin dangkal makin besar porsimu. Pot fee harian pool USDG ~= "
+                "usdg_fee_apr_pct/365/100 x (usdg_pool_usd+modal). Proyeksi fee "
+                "harianmu = pot x porsi — WAJIB dihitung eksplisit vs target "
+                f"${FEE_TARGET_USD_DAY:.0f}/hari dan vs proyeksi minus. Syarat sisa: "
+                "usdg_pool_vol_24h nyata (>= ~$20k/hari), bukan dump aktif "
+                "(chg_1h sangat merah), keamanan lolos. Posisi DUA SISI (±range/2).")
         else:
             extra += "Slot penuh — akhiri dengan DEPLOY: NONE."
         analysis = await ai_analyze(hits[:12], "auto-screening berkala", extra)

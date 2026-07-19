@@ -250,6 +250,48 @@ def _token_value_frac(sp: float, sa: float, sb: float, token_is_c0: bool) -> flo
     return (v_c0 if token_is_c0 else v_c1) / tot
 
 
+V4_TOO_LITTLE = "8b063d73"  # V4TooLittleReceived(uint256 minOut, uint256 actual)
+
+
+def _v4_swap_fn(w3, ur, p, tok_in, amt_in, min_out):
+    """Bangun call UR execute untuk satu swap v4 exact-in. Return (fn, value)."""
+    zf1 = tok_in.lower() == p["c0"].lower()
+    tok_out = p["c1"] if zf1 else p["c0"]
+    key = (Web3.to_checksum_address(p["c0"]), Web3.to_checksum_address(p["c1"]),
+           p["fee"], p["spacing"], Web3.to_checksum_address(p["hooks"]))
+    acts = bytes([0x06, 0x0c, 0x0f])  # SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL
+    swp = encode(
+        ["((address,address,uint24,int24,address),bool,uint128,uint128,bytes)"],
+        [(key, zf1, amt_in, min_out, b"")])
+    settle = encode(["address", "uint256"],
+                    [Web3.to_checksum_address(tok_in), amt_in])
+    take = encode(["address", "uint256"],
+                  [Web3.to_checksum_address(tok_out), min_out])
+    inputs = [encode(["bytes", "bytes[]"], [acts, [swp, settle, take]])]
+    deadline = w3.eth.get_block("latest").timestamp + 600
+    fn = ur.functions.execute(b"\x10", inputs, deadline)  # V4_SWAP
+    return fn, (amt_in if tok_in.lower() == NATIVE else 0)
+
+
+def _v4_probe_out(w3, acct, ur, p, tok_in, amt_in):
+    """Quote via revert: eth_call dengan min_out mustahil (2^120) — revert
+    V4TooLittleReceived membawa amountReceived ASLI (arg ke-2). Akurat untuk
+    pool tipis di mana estimasi sqrt_p bisa meleset ribuan kali (insiden
+    2026-07-19). Return None kalau pola error tak dikenal."""
+    import re
+    fn, value = _v4_swap_fn(w3, ur, p, tok_in, amt_in, 2 ** 120)
+    try:
+        w3.eth.call({"from": acct.address, "to": ur.address, "value": value,
+                     "data": fn._encode_transaction_data()})
+        return None
+    except Exception as e:
+        m = re.search(V4_TOO_LITTLE + r"[0-9a-f]{128}",
+                      repr(e).lower().replace("0x", ""))
+        if not m:
+            return None
+        return int(m.group(0)[len(V4_TOO_LITTLE) + 64:], 16)
+
+
 def buy_token(token: str, quote_units: int) -> dict:
     """Beli token pakai quote_units (raw) via Universal Router v4, pool terdalam.
     Simulasi dulu; raise RuntimeError kalau gagal."""
@@ -288,28 +330,17 @@ def buy_token(token: str, quote_units: int) -> dict:
     ur = w3.eth.contract(Web3.to_checksum_address(UNIVERSAL_ROUTER), abi=UR_ABI)
 
     def v4_leg(p, tok_in, amt_in):
-        """Simulasi + kirim satu swap v4 exact-in di pool p. Return tx hash.
-        Mirror rute jual yang terbukti; USDG pool token sering tipis -> 2-hop
-        lewat ETH native yang likuiditasnya dalam."""
-        zf1 = tok_in.lower() == p["c0"].lower()
-        tok_out = p["c1"] if zf1 else p["c0"]
-        price = (p["sqrt_p"] / Q96) ** 2
-        est_out = amt_in * price if zf1 else amt_in / price
-        min_out = max(1, min(int(est_out * 0.85), 2 ** 128 - 1))
-        key = (Web3.to_checksum_address(p["c0"]), Web3.to_checksum_address(p["c1"]),
-               p["fee"], p["spacing"], Web3.to_checksum_address(p["hooks"]))
-        acts = bytes([0x06, 0x0c, 0x0f])  # SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL
-        swp = encode(
-            ["((address,address,uint24,int24,address),bool,uint128,uint128,bytes)"],
-            [(key, zf1, amt_in, min_out, b"")])
-        settle = encode(["address", "uint256"],
-                        [Web3.to_checksum_address(tok_in), amt_in])
-        take = encode(["address", "uint256"],
-                      [Web3.to_checksum_address(tok_out), min_out])
-        inputs = [encode(["bytes", "bytes[]"], [acts, [swp, settle, take]])]
-        deadline = w3.eth.get_block("latest").timestamp + 600
-        fn = ur.functions.execute(b"\x10", inputs, deadline)  # V4_SWAP
-        value = amt_in if tok_in.lower() == NATIVE else 0
+        """Probe-quote dulu (hasil real dari revert V4TooLittleReceived),
+        baru kirim dengan min_out akurat; estimasi sqrt_p cuma fallback."""
+        actual = _v4_probe_out(w3, acct, ur, p, tok_in, amt_in)
+        if actual:
+            min_out = max(1, int(actual * 0.90))
+        else:
+            zf1 = tok_in.lower() == p["c0"].lower()
+            price = (p["sqrt_p"] / Q96) ** 2
+            est_out = amt_in * price if zf1 else amt_in / price
+            min_out = max(1, min(int(est_out * 0.85), 2 ** 128 - 1))
+        fn, value = _v4_swap_fn(w3, ur, p, tok_in, amt_in, min_out)
         w3.eth.call({"from": acct.address, "to": ur.address, "value": value,
                      "data": fn._encode_transaction_data()})
         return send(fn, value=value)
@@ -345,7 +376,20 @@ def buy_token(token: str, quote_units: int) -> dict:
             spend_nat = w3.eth.get_balance(acct.address) - reserve
             if spend_nat <= 0:
                 raise RuntimeError("USDG->ETH sukses tapi hasil <= cadangan gas")
-            tx = v4_leg(p2, NATIVE, spend_nat)  # native -> token
+            try:
+                tx = v4_leg(p2, NATIVE, spend_nat)  # native -> token
+            except Exception as e:
+                # UNDO leg1: balikin ETH -> USDG, jangan tinggalkan dana di ETH
+                # (kejadian 2026-07-19: leg2 revert 0x8b063d73, $26 nyangkut)
+                sisa = w3.eth.get_balance(acct.address) - reserve
+                if sisa > 0:
+                    try:
+                        v4_leg(p1, NATIVE, sisa)  # native -> USDG
+                    except Exception as e2:
+                        raise RuntimeError(
+                            f"beli token gagal DAN undo ETH->USDG gagal ({str(e2)[:80]})"
+                            " — ETH nyangkut, perlu sweep manual") from e
+                raise RuntimeError(f"beli token gagal (2-hop leg2): {str(e)[:100]}") from e
             return {"tx": tx, "fee": p2["fee"], "rute": "v4 2-hop via ETH"}
     else:
         gagal.append("v4 2-hop: pool native tidak lengkap")
@@ -596,25 +640,15 @@ def swap_all_to_quote(token: str) -> dict:
 
     def v4_leg(p, tok_in, amt_in):
         """Simulasi + kirim satu swap v4 exact-in di pool p. Return tx hash."""
-        zf1 = tok_in.lower() == p["c0"].lower()
-        tok_out = p["c1"] if zf1 else p["c0"]
-        price = (p["sqrt_p"] / Q96) ** 2  # harga c1 per c0 (unit raw)
-        est_out = amt_in * price if zf1 else amt_in / price
-        min_out = max(1, min(int(est_out * 0.85), 2 ** 128 - 1))
-        key = (Web3.to_checksum_address(p["c0"]), Web3.to_checksum_address(p["c1"]),
-               p["fee"], p["spacing"], Web3.to_checksum_address(p["hooks"]))
-        acts = bytes([0x06, 0x0c, 0x0f])  # SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL
-        swp = encode(
-            ["((address,address,uint24,int24,address),bool,uint128,uint128,bytes)"],
-            [(key, zf1, amt_in, min_out, b"")])
-        settle = encode(["address", "uint256"],
-                        [Web3.to_checksum_address(tok_in), amt_in])
-        take = encode(["address", "uint256"],
-                      [Web3.to_checksum_address(tok_out), min_out])
-        inputs = [encode(["bytes", "bytes[]"], [acts, [swp, settle, take]])]
-        deadline = w3.eth.get_block("latest").timestamp + 600
-        fn = ur.functions.execute(b"\x10", inputs, deadline)  # V4_SWAP
-        value = amt_in if tok_in.lower() == NATIVE else 0
+        actual = _v4_probe_out(w3, acct, ur, p, tok_in, amt_in)
+        if actual:
+            min_out = max(1, int(actual * 0.90))
+        else:
+            zf1 = tok_in.lower() == p["c0"].lower()
+            price = (p["sqrt_p"] / Q96) ** 2
+            est_out = amt_in * price if zf1 else amt_in / price
+            min_out = max(1, min(int(est_out * 0.85), 2 ** 128 - 1))
+        fn, value = _v4_swap_fn(w3, ur, p, tok_in, amt_in, min_out)
         w3.eth.call({"from": acct.address, "to": ur.address, "value": value,
                      "data": fn._encode_transaction_data()})
         return send(fn, value=value)
