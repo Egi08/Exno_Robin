@@ -92,7 +92,7 @@ def _find_pools(w3, quote: str, token: str) -> list[dict]:
 
 def best_v4_pool(token: str, for_lp: bool = False) -> dict | None:
     """Pool v4 quote/token. Default (swap): liquidity aktif terbesar.
-    for_lp=True (ala Yunus): fee tier TERENDAH di antara pool yang liquidity-nya
+    for_lp=True (fee-first): fee tier TERENDAH di antara pool yang liquidity-nya
     masih layak (>= 25% pool terdalam) — pool murah dapat routing volume lebih
     deras, fee income lebih konsisten."""
     quote_addr, _, _ = _quote_cfg()

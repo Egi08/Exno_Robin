@@ -22,7 +22,7 @@ NETWORK = os.environ.get("NETWORK_SLUG", "robinhood")
 CAPITAL = float(os.environ.get("DRY_RUN_CAPITAL_USD", 50))
 MIN_VOL_5M = float(os.environ.get("MIN_VOL_5M_USD", 100_000))
 MIN_LIQ = float(os.environ.get("MIN_LIQUIDITY_USD", 50_000))
-# filter ala @0xyunss (tf 24 jam)
+# filter fee-first (tf 24 jam)
 MIN_VOL_24H = float(os.environ.get("MIN_VOL_24H_USD", 1_000_000))
 MIN_MCAP = float(os.environ.get("MIN_MCAP_USD", 500_000))
 DEX_BLACKLIST = {d.strip().lower() for d in
@@ -66,7 +66,7 @@ def main():
     data = get_json(f"https://api.geckoterminal.com/api/v2/networks/{NETWORK}/trending_pools?page=1")
     rows = [pool_row(p) for p in data.get("data", [])]
     rows = [r for r in rows if not any(b in (r["dex"] or "").lower() for b in DEX_BLACKLIST)]
-    # filter keras ala @0xyunss dihitung sebagai anotasi; AI lihat semua kandidat
+    # filter keras fee-first dihitung sebagai anotasi; AI lihat semua kandidat
     for r in rows:
         gagal = []
         if r["mcap_usd"] < MIN_MCAP:
@@ -88,7 +88,7 @@ def main():
     prompt = (
         f"Kamu agent LP DeFi. Modal saya HANYA ${CAPITAL:.0f} (dry run, ETH di Robinhood Chain, "
         "LP Uniswap v3 one-sided lower). Data pool trending (JSON) di bawah.\n"
-        "Checklist ala @0xyunss: tiap kandidat punya `lolos_filter` + `alasan_gagal` "
+        "Checklist fee-first: tiap kandidat punya `lolos_filter` + `alasan_gagal` "
         "dari filter keras (mcap > $500k, vol24h > $1m, liq cukup). Prioritaskan yang lolos; "
         "yang gagal tipis boleh diselamatkan dengan alasan kuat, yang lolos tapi mencurigakan coret. "
         "Prioritaskan token utilitas (meme lagi lemah), tolak token launchpad murahan, "

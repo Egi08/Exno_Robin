@@ -6,7 +6,7 @@ Bot LP (liquidity provider) otonom untuk **Robinhood Chain** — screening token
 
 Tiap siklus (default 5 menit) bot menjalankan tiga fase:
 
-1. **Screening** — tarik kandidat dari GeckoTerminal (trending + top volume), filter keras metode Yunus (@0xyunss): mcap > $500k, vol 24h > $1M, fee riil 24h, likuiditas cukup, blacklist launchpad scam. Diperkaya data **GoPlus** (honeypot, tax, holders, top-10) dan **GMGN** (smart money, KOL, rug ratio, bundler rate, wash trading) — token berbahaya dicoret otomatis.
+1. **Screening** — tarik kandidat dari GeckoTerminal (trending + top volume), filter keras metode fee-first: mcap > $500k, vol 24h > $1M, fee riil 24h, likuiditas cukup, blacklist launchpad scam. Diperkaya data **GoPlus** (honeypot, tax, holders, top-10) dan **GMGN** (smart money, KOL, rug ratio, bundler rate, wash trading) — token berbahaya dicoret otomatis.
 2. **Analisis AI** — kandidat dikirim ke LLM (endpoint utama + cadangan) yang memberi skor, risiko, rekomendasi range, dan keputusan akhir satu baris `DEPLOY: <ca> <range>` atau `DEPLOY: NONE`. Ekspektasi fee dihitung dari pool USDG tempat posisi benar-benar dibuka, bukan pool WETH terbesar.
 3. **Deploy** — posisi Uniswap **v4** dua sisi (in-range langsung, beli token via Universal Router dengan fallback rute 2-hop lewat ETH native) atau one-sided lower v3/v4 sebagai fallback. Sizing = % saldo (compound otomatis).
 

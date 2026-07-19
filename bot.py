@@ -26,10 +26,10 @@ log = logging.getLogger("lp-robin")
 NETWORK = os.environ.get("NETWORK_SLUG", "eth")
 MIN_VOL_5M = float(os.environ.get("MIN_VOL_5M_USD", 100_000))
 MIN_LIQ = float(os.environ.get("MIN_LIQUIDITY_USD", 50_000))
-# filter ala @0xyunss (tf 24 jam): mcap > $500k, vol > $1m, hindari flap.fun
+# filter fee-first (tf 24 jam): mcap > $500k, vol > $1m, hindari flap.fun
 MIN_VOL_24H = float(os.environ.get("MIN_VOL_24H_USD", 1_000_000))
 MIN_MCAP = float(os.environ.get("MIN_MCAP_USD", 500_000))
-# metode Yunus (GMGN): total fee 24h pool minimal segini (ETH) — token harus
+# metode fee-first (GMGN): total fee 24h pool minimal segini (ETH) — token harus
 # MENGHASILKAN fee nyata, bukan cuma volume
 MIN_FEES_ETH = float(os.environ.get("MIN_FEES_24H_ETH", 0.4))
 DEX_BLACKLIST = {d.strip().lower() for d in
@@ -67,7 +67,7 @@ MIN_USDG_POOL_USD = float(os.environ.get("MIN_USDG_POOL_USD", 500))
 MIN_HOLDERS = int(os.environ.get("MIN_HOLDERS", 500))
 MAX_TOP10_PCT = float(os.environ.get("MAX_TOP10_PCT", 60))
 # anti beli pucuk: tunda deploy kalau token lagi pump aktif — akar penyebab
-# posisi cepat kabur ke atas range (timing ala Yunus: masuk setelah koreksi)
+# posisi cepat kabur ke atas range (timing fee-first: masuk setelah koreksi)
 MAX_CHG_5M = float(os.environ.get("MAX_DEPLOY_CHG_5M_PCT", 3))
 MAX_CHG_1H = float(os.environ.get("MAX_DEPLOY_CHG_1H_PCT", 10))
 BLACKLIST_FILE = os.path.join(os.path.dirname(__file__), "token-blacklist.json")
@@ -310,8 +310,8 @@ async def ai_analyze(rows: list[dict], mode: str, extra: str = "") -> str:
         "`usdg_fee_apr_pct` (kalau ada). Vol pool USDG kecil = fee nyata kecil walau "
         "pool WETH-nya ramai — turunkan skor kandidat seperti itu.\n"
         "`fees_24h_usd` = total fee riil yang dihasilkan pool 24h (kolom 'Total Fees' GMGN) — "
-        "INTI metode Yunus: token wajib menghasilkan fee nyata, bukan cuma volume.\n"
-        "Checklist screening (metode Yunus / @0xyunss, tf 24 jam):\n"
+        "INTI metode fee-first: token wajib menghasilkan fee nyata, bukan cuma volume.\n"
+        "Checklist screening (metode fee-first, tf 24 jam):\n"
         "- tiap kandidat punya `lolos_filter` + `alasan_gagal` dari filter keras "
         "(mcap > $500k, vol 24h > $1m, liq cukup, fees 24h >= 0.4 ETH). Prioritaskan yang lolos. "
         "Yang gagal boleh kamu selamatkan HANYA jika gagalnya tipis dan ada alasan kuat "
@@ -331,7 +331,7 @@ async def ai_analyze(rows: list[dict], mode: str, extra: str = "") -> str:
            "gampang tembus batah bawah = 100% token); MAKS 40%. Karena dua sisi, "
            "range sempit hanya untuk token yang harganya stabil/support kuat.\n"
            if TWO_SIDED else
-           "- rekomendasi range ala Yunus (range = jarak dari harga sekarang ke batas bawah): "
+           "- rekomendasi range fee-first (range = jarak dari harga sekarang ke batas bawah): "
            "UTAMAKAN LEBAR -30% s/d -50% untuk meme runner volatil (nunggu dip, jarang kena stop-loss, "
            "tetap makan fee tiap harga masuk range); -10% s/d -15% HANYA untuk token yang sudah "
            "terbukti di support kuat; kalau bigcap runner sarankan full range (deploy manual)\n")
@@ -420,7 +420,7 @@ def _gmgn_trending() -> dict:
 
 async def fetch_candidates():
     """Screening tahap 1: trending + top pool Uniswap v3 (ala lp-terminal),
-    dedupe, lalu anotasi filter keras ala @0xyunss."""
+    dedupe, lalu anotasi filter keras fee-first."""
     # harga ETH diambil DULUAN (sebelum 4 request sumber di bawah) biar tidak
     # kena rate limit GT; + 1x retry
     eth_usd = 0.0
@@ -1140,7 +1140,7 @@ async def _manage_locked():
                     and now >= p["entry_price"] * (1 + REBAL_PCT / 100)):
                 p["_reb"] = now
             # stop-loss dari PnL BERSIH: rugi harga dikurangi fee yang sudah
-            # terkumpul (ala Yunus — fee adalah untungnya)
+            # terkumpul (fee-first — fee adalah untungnya)
             net = pnl
             if pnl is not None and fee_usd and cap > 0:
                 net = pnl + fee_usd / cap * 100
@@ -1422,7 +1422,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/close <no> — tarik likuiditas + jual ke USDG\n"
         "/pnl — untung/rugi total vs modal (/pnl set <usd> catat modal)\n"
         "/evolve — AI evaluasi histori & saran threshold (≥5 posisi tertutup)\n"
-        f"\nNetwork: `{NETWORK}` | Filter 24h (metode Yunus): mcap ≥ ${MIN_MCAP:,.0f}, "
+        f"\nNetwork: `{NETWORK}` | Filter 24h (metode fee-first): mcap ≥ ${MIN_MCAP:,.0f}, "
         f"vol ≥ ${MIN_VOL_24H:,.0f}, liq ≥ ${MIN_LIQ:,.0f}, "
         f"fees ≥ {MIN_FEES_ETH:g} ETH | Maks {MAX_POSITIONS} posisi\n"
         + (f"⏰ Auto-cycle tiap {AUTO_MIN:.0f} menit (quote {QUOTE}, "
