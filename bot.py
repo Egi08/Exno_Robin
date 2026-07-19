@@ -63,6 +63,7 @@ OUT_RANGE_CLOSE_MIN = float(os.environ.get("OUT_OF_RANGE_CLOSE_MIN", 30))
 TOKEN_COOLDOWN_H = float(os.environ.get("TOKEN_COOLDOWN_H", 6))
 # kedalaman minimal sisi USDG pool supaya dianggap layak LP
 MIN_USDG_POOL_USD = float(os.environ.get("MIN_USDG_POOL_USD", 500))
+MIN_USDG_POOL_VOL = float(os.environ.get("MIN_USDG_POOL_VOL_USD", 20_000))
 # target fee harian (USD) — arah berburu AI: fee harus menutup minus harga
 FEE_TARGET_USD_DAY = float(os.environ.get("FEE_TARGET_USD_DAY", 10))
 # rotasi fee-hunter: posisi umur >= MIN_H jam dengan laju fee < MIN_PCT_DAY
@@ -651,6 +652,10 @@ async def fetch_candidates():
                         data = await gt_get(
                             f"/networks/{NETWORK}/tokens/{r['ca']}/pools?page=1")
                         up = [pool_row(q) for q in data.get("data", [])]
+                        # metrik sama dgn management agent (vol pool terbesar)
+                        # biar gate deploy & auto-close konsisten
+                        r["max_pool_vol_24h"] = round(max(
+                            (u["vol_24h"] for u in up), default=0))
                         up = [u for u in up if "USDG" in (u["name"] or "").upper()]
                         if up:
                             u = max(up, key=lambda x: x["vol_24h"])
@@ -1487,8 +1492,11 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE):
                 "makin dangkal makin besar porsimu. Pot fee harian pool USDG ~= "
                 "usdg_fee_apr_pct/365/100 x (usdg_pool_usd+modal). Proyeksi fee "
                 "harianmu = pot x porsi — WAJIB dihitung eksplisit vs target "
-                f"${FEE_TARGET_USD_DAY:.0f}/hari dan vs proyeksi minus. Syarat sisa: "
-                "usdg_pool_vol_24h nyata (>= ~$20k/hari), bukan dump aktif "
+                f"${FEE_TARGET_USD_DAY:.0f}/hari dan vs proyeksi minus. "
+                "Syarat sisa (DICEK KODE, pilihan yang melanggar auto-skip — "
+                f"jangan buang pilihan): usdg_pool_vol_24h >= ${MIN_USDG_POOL_VOL:,.0f}"
+                f"/hari DAN vol pool terbesar >= ${MIN_POOL_VOL_ALERT:,.0f} "
+                "(ambang auto-close management), bukan dump aktif "
                 "(chg_1h sangat merah), keamanan lolos. Posisi DUA SISI (±range/2).")
         else:
             extra += "Slot penuh — akhiri dengan DEPLOY: NONE."
@@ -1527,8 +1535,27 @@ async def auto_cycle(ctx: ContextTypes.DEFAULT_TYPE):
                 r = next((x for x in hits if x["ca"].lower() == ca.lower()), None)
                 chg5 = float((r or {}).get("chg_5m") or 0)
                 chg1h = float((r or {}).get("chg_1h") or 0)
+                uvol = float((r or {}).get("usdg_pool_vol_24h") or 0)
+                mvol = float((r or {}).get("max_pool_vol_24h") or 0)
                 if eth_size <= 0:
                     deploy_msg = "\n\n🤖 Saldo tidak cukup untuk deploy — skip."
+                elif QUOTE == "USDG" and uvol < MIN_USDG_POOL_VOL:
+                    # syarat sisa strategi "jadi pool-nya" — AI suka
+                    # merasionalisasi ambang ini, jadi ditegakkan di kode
+                    deploy_msg = (f"\n\n🤖 {(r or {}).get('name', ca)}: vol 24h "
+                                  f"pool USDG ${uvol:,.0f} < ${MIN_USDG_POOL_VOL:,.0f} "
+                                  "— fee encer, skip.")
+                    log_decision({"actor": "auto", "action": "skip_usdg_vol",
+                                  "ca": ca, "usdg_pool_vol_24h": uvol})
+                elif mvol and mvol < MIN_POOL_VOL_ALERT:
+                    # ambang sama dgn auto-close management: deploy di bawah
+                    # ini langsung ditutup siklus berikutnya (churn rugi fee)
+                    deploy_msg = (f"\n\n🤖 {(r or {}).get('name', ca)}: vol pool "
+                                  f"terbesar ${mvol:,.0f} < ambang management "
+                                  f"${MIN_POOL_VOL_ALERT:,.0f} — bakal langsung "
+                                  "auto-close, skip.")
+                    log_decision({"actor": "auto", "action": "skip_pool_vol",
+                                  "ca": ca, "max_pool_vol_24h": mvol})
                 elif chg5 > MAX_CHG_5M or chg1h > MAX_CHG_1H:
                     # anti beli pucuk: pump aktif = posisi langsung kabur ke atas
                     # range; tunggu koreksi, coba lagi siklus depan
