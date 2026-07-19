@@ -1,0 +1,19 @@
+# rahasia — JANGAN pernah di-commit
+.env
+
+# state runtime
+positions.json
+decision-log.json
+token-blacklist.json
+pnl-baseline.json
+TARGET_REACHED
+.bot.lock
+*.out
+
+# python
+__pycache__/
+*.pyc
+venv/
+
+# backup
+*.bak*
