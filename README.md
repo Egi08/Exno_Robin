@@ -10,7 +10,9 @@ Tiap siklus (default 5 menit) bot menjalankan tiga fase:
 2. **Analisis AI** — kandidat dikirim ke LLM (endpoint utama + cadangan) yang memberi skor, risiko, rekomendasi range, dan keputusan akhir satu baris `DEPLOY: <ca> <range>` atau `DEPLOY: NONE`. Ekspektasi fee dihitung dari pool USDG tempat posisi benar-benar dibuka, bukan pool WETH terbesar.
 3. **Deploy** — posisi Uniswap **v4** dua sisi (in-range langsung, beli token via Universal Router dengan fallback rute 2-hop lewat ETH native) atau one-sided lower v3/v4 sebagai fallback. Sizing = % saldo (compound otomatis).
 
-**Management agent** mengawasi posisi tiap 5 menit dengan data on-chain real (tick pool, isi posisi, fee unclaimed — bukan estimasi): stop-loss dari net PnL (harga + fee), take-profit fee, auto-close saat lama di atas range atau volume pool mengering, sweeper token nyangkut, dan heartbeat Telegram yang hanya bunyi kalau ada info baru.
+**Management agent** mengawasi posisi tiap 5 menit dengan data on-chain real (tick pool, isi posisi, fee unclaimed — bukan estimasi): stop-loss dari net PnL (harga + fee), take-profit fee, auto-close saat lama di atas range atau volume pool mengering, rotasi posisi ber-laju-fee rendah (gaya multihour), sweeper token nyangkut, dan heartbeat Telegram berbentuk kartu (bar range visual, `Nilai + Fee = Total`, net PnL headline) yang hanya bunyi kalau ada info baru.
+
+**Mode fee-hunter:** AI diarahkan mengejar target fee harian (`FEE_TARGET_USD_DAY`) dengan matematika porsi pot — di pool USDG dangkal, porsi fee LP ≈ modal ÷ (modal + isi pool), jadi pool kecil justru peluang. Slippage swap dihitung akurat lewat *quote-via-revert* (baca hasil real dari error `V4TooLittleReceived`), dan kegagalan beli 2-hop di-undo otomatis supaya dana selalu kembali ke USDG.
 
 ## Perintah Telegram
 
